@@ -4,7 +4,7 @@ from torch.utils.data import Dataset
 from dataclasses import dataclass
 import torch
 from torch.utils.data import Dataset, DataLoader
-from diffusers import UNet2DModel
+from diffusers import DiTTransformer2DModel
 import torch
 from PIL import Image
 import numpy as np
@@ -25,27 +25,23 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch.utils.tensorboard import SummaryWriter
 
 class ZarrDataset(Dataset):
-    """
-    This is a new zarr instance of the dataset that loads all data into CPU memory to minimize I/O overhead.
-    """
+    """This is a new zarr instance of the dataset chunked at the desired batchsize to ensure the GPU is fed. """
     def __init__(self, zarr_store):
         self.store = zarr_store
         self.data = zarr.open(self.store, mode='r')
-        
-        # Load data into CPU memory
-        self.input_images = torch.tensor(self.data['input_images'][:], dtype=torch.float16, device='cpu')
-        self.output_images = torch.tensor(self.data['output_images'][:], dtype=torch.float16, device='cpu')
-        self.length = self.input_images.shape[0]
+        self.length = self.data['input_images'].shape[0]
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        # Access data from memory (still on the CPU)
-        return self.output_images[idx], self.input_images[idx]
+        # Load data lazily
+        input_image = self.data['input_images'][idx]
+        output_image = self.data['output_images'][idx]
+        return torch.tensor(output_image, dtype=torch.float16),torch.tensor(input_image, dtype=torch.float16)
 
 # Initialize the dataset
-zarr_store = '/home/rchas1/diffusion_10_4_2inputs_v3_gh200.zarr'
+zarr_store = '/mnt/data1/rchas1/diffusion_10_4_2inputs_v2_gh200.zarr'
 dataset = ZarrDataset(zarr_store)
 
 # ################### \Imports ########################
@@ -59,13 +55,13 @@ class TrainingConfig:
     image_size = 256  
     train_batch_size = 45 #need to check if this can fit...
     val_batch_size = 45
-    num_epochs = 210 # 
+    num_epochs = 210 #this should be about 
     gradient_accumulation_steps = 1 #shouldnt need this if i am not adding noise 
     learning_rate = 1e-4 
     lr_warmup_steps = 500
     save_model_epochs = 1 
     mixed_precision = "fp16" 
-    output_dir = "/mnt/data1/rchas1/vanilla_unet_10_two_inputs_v2/"  # the local path to store the model 
+    output_dir = "/mnt/data1/rchas1/vanilla_tf_10_two_inputs/"  # the local path to store the model 
     push_to_hub = False
     hub_private_repo = False
     overwrite_output_dir = True  
@@ -96,7 +92,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
         accelerator.init_trackers("train_example")
 
         #Stuff to have an image show up 
-        writer = SummaryWriter("/mnt/data1/rchas1/vanilla_unet_10_two_inputs_v2/logs/images")
+        writer = SummaryWriter("/mnt/data1/rchas1/vanilla_tf_10_two_inputs/logs/images")
                 #define random noise/seed vectors, here is enough seeds to run one batch of data through (i.e., one image per batch)
 
         #grab a batch of data 
@@ -110,20 +106,20 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
                     
         #colorize an image 
         image = condition_images_eval[0,0:1].squeeze(0).unsqueeze(-1).cpu()
-        color_image = torch.tensor(colorize(image,vmin=-4,vmax=2,cmap='Spectral_r')).permute(2, 0, 1)
+        color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
         
         #add in the input images
         writer.add_image("Training Data", color_image, 0)
         
         #colorize an image 
         image = condition_images_eval[0,1:2].squeeze(0).unsqueeze(-1).cpu()
-        color_image = torch.tensor(colorize(image,vmin=-4,vmax=2,cmap='Spectral_r')).permute(2, 0, 1)
+        color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
         writer.add_image("Training Data", color_image, 1)
 
 
         #colorize an image 
         image = clean_images_eval[0,0:1].squeeze(0).unsqueeze(-1).cpu()
-        color_image = torch.tensor(colorize(image,vmin=-4,vmax=2,cmap='Spectral_r')).permute(2, 0, 1)
+        color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
         writer.add_image("Training Data", color_image, 2)
         writer.add_image("Slider", color_image, 0)
         
@@ -144,6 +140,8 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
     no_improvement_count = 0
     window_size = 5  # Define the window size for the moving average
     loss_history = [] # Initialize a list to store the recent losses
+    best_model_state_dict = None
+
     
     #define loss 
     loss_fn = torch.nn.MSELoss(reduction='none')
@@ -173,7 +171,9 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
             #this is the autograd steps within the .accumulate bit (this is important for multi-GPU training)
             with accelerator.accumulate(model):
                 
-                yhat = model(condition_images,torch.zeros(condition_images.shape[0]).to(condition_images.device), return_dict=False)[0]
+                yhat = model(condition_images,torch.zeros(condition_images.shape[0]).to(condition_images.device),
+                             class_labels=torch.zeros(condition_images.shape[0]).to(torch.int).to(condition_images.device),
+                             return_dict=False)[0]
                 
                 #send data into loss func and get the loss (the model call is in here)
                 loss = loss_fn(clean_images.to(torch.float),yhat.to(torch.float)).mean()
@@ -229,7 +229,9 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
                 #Sep. conditions
                 condition_images = batch[1].to('cuda:0')
             
-                yhat = model(condition_images,torch.zeros(condition_images.shape[0]).to(condition_images.device), return_dict=False)[0]
+                yhat = model(condition_images,torch.zeros(condition_images.shape[0]).to(condition_images.device),
+                             class_labels=torch.zeros(condition_images.shape[0]).to(torch.int).to(condition_images.device),
+                             return_dict=False)[0]
                 
                 #send data into loss func and get the loss (the model call is in here)
                 loss = loss_fn(clean_images,yhat).mean()
@@ -262,6 +264,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
             if moving_average < (best_loss - min_delta):
                 best_loss = moving_average
                 no_improvement_count = 0
+                best_model_state_dict = accelerator.unwrap_model(model).state_dict()
             else:
                 no_improvement_count += 1
         
@@ -278,11 +281,13 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
                     
                     with torch.no_grad():
                         #run a batch of images through
-                        images_batch = model(condition_images,torch.zeros(condition_images.shape[0]).to(condition_images.device), return_dict=False)[0]
+                        images_batch = model(condition_images,torch.zeros(condition_images.shape[0]).to(condition_images.device),
+                                             class_labels=torch.zeros(condition_images.shape[0]).to(torch.int).to(condition_images.device),
+                                             return_dict=False)[0]
                     
                     #colorize the image 
                     image = images_batch[0].squeeze(0).unsqueeze(-1).cpu().numpy()
-                    color_image = torch.tensor(colorize(image,vmin=-4,vmax=2,cmap='Spectral_r')).permute(2, 0, 1)
+                    color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
                     
                     #add static example here, generate one image, add to board
                     writer.add_image("Output Image", color_image, epoch)
@@ -292,7 +297,7 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
                     
                     #add the original image again so the slider updates?
                     image = clean_images_eval[0,0:1].squeeze(0).unsqueeze(-1).cpu()
-                    color_image = torch.tensor(colorize(image,vmin=-4,vmax=2,cmap='Spectral_r')).permute(2, 0, 1)
+                    color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
                     writer.add_image("Slider", color_image, 0)
 
         # Check if training should be stopped due to lack of improvement
@@ -303,12 +308,16 @@ def train_loop(config, model, optimizer, train_dataloader, lr_scheduler, val_dat
                 print(f"Killing multi-GPU processes using dist.barrier() and dist.destroy_process_group()")
                 # Signal all processes to stop
                 dist.barrier()  # Ensure all processes are synchronized
-                dist.destroy_process_group() 
+                dist.destroy_process_group()
+                
+            #save the best model
+            if best_model_state_dict is not None:
+                torch.save(best_model_state_dict, config.output_dir + "best_model.pth")
                 
             break
                     
         gc.collect()
-        
+
 import matplotlib
 import matplotlib.cm
 
@@ -366,29 +375,7 @@ train_dataloader = torch.utils.data.DataLoader(ds_train, batch_size=config.train
 val_dataloader = torch.utils.data.DataLoader(ds_val, batch_size=config.val_batch_size, shuffle=False)
 
 # go ahead and build a UNET, this was the exact same as the butterfly example, but different channels. This is a big model.. 
-model = UNet2DModel(
-    sample_size=config.image_size,  # the target image resolution
-    in_channels=2,  # the number of input channels, 3 for RGB images
-    out_channels=1,  # the number of output channels
-    layers_per_block=2,  # how many ResNet layers to use per UNet block
-    block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
-    down_block_types=(
-        "DownBlock2D",  # a regular ResNet downsampling block
-        "DownBlock2D",
-        "DownBlock2D",
-        "DownBlock2D",
-        "AttnDownBlock2D",  # a ResNet downsampling block with spatial self-attention
-        "DownBlock2D",
-    ),
-    up_block_types=(
-        "UpBlock2D",  # a regular ResNet upsampling block
-        "AttnUpBlock2D",  # a ResNet upsampling block with spatial self-attention
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-        "UpBlock2D",
-    ),
-)
+model = DiTTransformer2DModel(in_channels=2,  out_channels=1,num_layers=6,patch_size=8)
 
 #left this the same as the butterfly example 
 optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)

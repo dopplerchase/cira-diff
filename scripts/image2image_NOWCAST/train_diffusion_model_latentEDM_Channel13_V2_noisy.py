@@ -1,4 +1,4 @@
-#################### Imports ########################
+# ################### Imports ########################
 
 import torch
 import zarr
@@ -24,12 +24,13 @@ import math
 from typing import List, Optional, Tuple, Union
 from diffusers.utils.torch_utils import randn_tensor
 from torch.utils.tensorboard import SummaryWriter
+from diffusers import AutoencoderKL
 
 
-#################### \Imports ########################
+# ################### \Imports ########################
 
 
-#################### Classes ########################
+# ################### Classes ########################
 
 @dataclass
 class TrainingConfig:
@@ -39,20 +40,21 @@ class TrainingConfig:
     train_batch_size = 45 #this is as big as I can fit on the GH200 [45,3,256,256]
     
     #training things 
-    num_epochs = 1000 #this should be similar to NVIDIA's StormCast 
-    gradient_accumulation_steps = 2 #this helped with stability, i think... 
+    num_epochs = 2000 #this should be similar to NVIDIA's StormCast 
+    gradient_accumulation_steps = 1 #this helped with stability, i think... 
     learning_rate = 1e-4 #default value from butterflies example
     lr_warmup_steps = 500 #default value from butterflies example
     save_model_epochs = 1 #i like to save alot, doesnt cost much 
     mixed_precision = "fp16"
-    output_dir = "/mnt/data1/rchas1/diffusion_edm_fixed_scaling/"  # the local path to store the model 
+    output_dir = "/mnt/data1/rchas1/latentedm_10_two_inputs_AuraDiffusion_noisy_longer/"  # the local path to store the model 
     push_to_hub = False 
     hub_private_repo = False
     overwrite_output_dir = True  
     seed = 0 
-    restart = False #do you want to start from a previous training?
-    restart_path = "/mnt/data1/rchas1/diffusion_edm_fixed_scaling/"
-    dataset_path = "/home/rchas1/diffusion_10_4_2inputs_v3_gh200.zarr"
+    restart = True #do you want to start from a previous training?
+    restart_path = "/mnt/data1/rchas1/latentedm_10_two_inputs_AuraDiffusion_noisy/"
+    
+    dataset_path = "/mnt/data1/rchas1/diffusion_10_4_2inputs_v2_gh200_latent_AuraDiffusion.zarr"
     
     #tensorboard things 
     plot_images = True 
@@ -68,9 +70,11 @@ class TrainingConfig:
     min_delta = 1e-6  # Minimum change in loss to be considered as improvement
     window_size = 5  # Define the window size for the moving average
     
+    #vae path on huggingface
+    vae_path = "AuraDiffusion/16ch-vae"
+
     
-    
-    
+
 class EDMPrecond(torch.nn.Module):
     """ Original Func:: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/training/networks.py#L519
     
@@ -94,6 +98,8 @@ class EDMPrecond(torch.nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
+        self.in_channels = model.in_channels
+        self.out_channels = model.out_channels
         
     def forward(self, x, sigma, force_fp32=False, **model_kwargs):
         
@@ -122,16 +128,9 @@ class EDMPrecond(torch.nn.Module):
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
-
-        # split out the images you want to generate and the condition, because the scaling will depend on this. 
-        x_noisy = torch.clone(x[:,0:self.generation_channels])
         
-        #the condition
-        x_condition = torch.clone(x[:,self.generation_channels:])
-
-        
-        #concatinate back with the scaling applied to only the the generation dimension (x_noisy)
-        model_input_images = torch.cat([x_noisy*c_in, x_condition], dim=1)
+        #add noise to the whole thing 
+        model_input_images = torch.clone(x*c_in)
         
         #denoise the image (e.g., run it through your diffusers model) 
         F_x = self.model((model_input_images).to(dtype), c_noise.flatten(), return_dict=False)[0]
@@ -140,7 +139,7 @@ class EDMPrecond(torch.nn.Module):
         assert F_x.dtype == dtype
         
         #apply additional scalings: make sure you apply skip just to the generation dim (x[:,0:generation_channel]) and NOT applied to (x*c_in)
-        D_x = c_skip * x_noisy + c_out * F_x.to(torch.float32)
+        D_x = c_skip * x[:,0:self.generation_channels] + c_out * F_x.to(torch.float32)
         
         return D_x
 
@@ -172,6 +171,7 @@ class EDMLoss:
         
         #get random seeds, one for each image in the batch 
         rnd_normal = torch.randn([clean_images.shape[0], 1, 1, 1], device=clean_images.device)
+        model_input_images = torch.cat([clean_images, condition_images], dim=1)
         
         #get random noise levels (sigmas)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -179,66 +179,40 @@ class EDMLoss:
         #get the loss weight for those sigmas 
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         
-        #make the noise scalars images so we can add them to our images
-        n = torch.randn_like(clean_images) * sigma
-    
-        #add noise to the clean images 
-        noisy_images = torch.clone(clean_images + n)
+         #does the noise have to be different for each channel? or should it all be the same? LOOK THIS UP 
+        n = torch.randn_like(model_input_images) * sigma
         
-        #cat the images for the wrapped model call 
-        model_input_images = torch.cat([noisy_images, condition_images], dim=1)
+        #add noise to the clean images 
+        noisy_images = torch.clone(model_input_images + n)
         
         #call the EDMPrecond model 
-        denoised_images = net(model_input_images, sigma)
+        denoised_images = net(noisy_images, sigma)
         
         #calc the weighted loss at each pixel, the mean across all GPUs and pixels is in the main train_loop 
         loss = weight * ((denoised_images - clean_images) ** 2)
         
         return loss
-    
-# class ZarrDataset(Dataset):
-#     """This is a new zarr instance of the dataset chunked at the desired batchsize to ensure the GPU is fed. """
-#     def __init__(self, zarr_store):
-#         self.store = zarr_store
-#         self.data = zarr.open(self.store, mode='r')
-#         self.length = self.data['input_images'].shape[0]
-
-#     def __len__(self):
-#         return self.length
-
-#     def __getitem__(self, idx):
-#         # Load data lazily
-#         input_image = self.data['input_images'][idx]
-#         output_image = self.data['output_images'][idx]
-#         return torch.tensor(output_image, dtype=torch.float16),torch.tensor(input_image, dtype=torch.float16)
 
 class ZarrDataset(Dataset):
-    """
-    This is a new zarr instance of the dataset that loads all data into CPU memory to minimize I/O overhead.
-    """
+    """This is a new zarr instance of the dataset chunked at the desired batchsize to ensure the GPU is fed. """
     def __init__(self, zarr_store):
         self.store = zarr_store
         self.data = zarr.open(self.store, mode='r')
-        
-        # Load data into CPU memory
-        self.input_images = torch.tensor(self.data['input_images'][:], dtype=torch.float16, device='cpu')
-        self.output_images = torch.tensor(self.data['output_images'][:], dtype=torch.float16, device='cpu')
-        self.length = self.input_images.shape[0]
+        self.length = self.data['input_images'].shape[0]
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        # Access data from memory (still on the CPU)
-        return self.output_images[idx], self.input_images[idx]
+        # Load data lazily
+        input_image = self.data['input_images'][idx]
+        output_image = self.data['output_images'][idx]
+        return torch.tensor(output_image, dtype=torch.float16),torch.tensor(input_image, dtype=torch.float16)
 
-#################### \Classes ########################
+# ################### \Classes ########################
 
-#################### Funcs ########################
+# ################### Funcs ########################
 
-def worker_init_fn(worker_id):
-    os.sched_setaffinity(0, range(os.cpu_count())) 
-    
 def train_loop(config, model, optimizer, dataset, lr_scheduler):
     """ 
     This is the main show! the training loop. 
@@ -270,11 +244,17 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
         
         if config.plot_images:
             
+            #need to decode the images
+            #load vae 
+#             vae =  AutoencoderKL.from_pretrained(config.vae_path, subfolder="vae").to('cuda')
+            vae =  AutoencoderKL.from_pretrained(config.vae_path).to('cuda')
+            
+            
             #image writer for the tensorboard 
             writer = SummaryWriter(config.output_dir + "logs/images")
             #need a random seed for the edm process that we run after every epoch.         
             rnd = StackedRandomGenerator('cuda',np.arange(0,config.train_batch_size,1).astype(int).tolist())
-            latents = rnd.randn([config.train_batch_size, 1, 256, 256],device='cuda')
+            latents = rnd.randn([config.train_batch_size, vae.config.latent_channels, 32, 32],device='cuda')
 
             #setup the dataset now WITHOUT shuffling, for consistent eval images 
             train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=False)
@@ -290,28 +270,54 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
 
             del train_dataloader 
             
+
+            #reshape images for the decoding 
+            condition_images_eval_reshaped = torch.reshape(condition_images_eval,
+                                                           [condition_images_eval.shape[0]*2,
+                                                            vae.config.latent_channels,
+                                                            condition_images_eval.shape[2],
+                                                            condition_images_eval.shape[3]])
+            
+            clean_images_eval_reshaped =  torch.reshape(clean_images_eval,
+                                                           [clean_images_eval.shape[0]*1,
+                                                            vae.config.latent_channels,
+                                                            clean_images_eval.shape[2],
+                                                            clean_images_eval.shape[3]])
+            #check recons. just in case, trust issues 
+            with torch.no_grad():
+                reconstructed_condition = vae.decode(condition_images_eval_reshaped.to(torch.float)) #input should be [batch*channel,4,64,64]
+                #take the mean across RGB 
+                reconstructed_condition = reconstructed_condition.sample.mean(axis=1) #reconstructed should be [batch*channel,3,256,256]
+                
+                reconstructed_label = vae.decode(clean_images_eval_reshaped.to(torch.float)) #input should be [batch*channel,4,64,64]
+                #take the mean across RGB 
+                reconstructed_label = reconstructed_label.sample.mean(axis=1) #reconstructed should be [batch*channel,3,256,256]
+                
+            #put it back to the normal shape 
+            reconstructed_condition_unshaped = torch.reshape(reconstructed_condition,[condition_images_eval.shape[0],2,256,256])
+            reconstructed_label_unshaped = torch.reshape(reconstructed_label,[condition_images_eval.shape[0],1,256,256])
+            
             for i in np.arange(0,len(config.images_idx)):
                 #reshape image for adding a color image to the tensorboard 
-                image = condition_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
+                image = reconstructed_condition_unshaped[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
                 #add color and convert shapes back. 
-                color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
+                color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
 
                 #write the image to the tensorboard 
                 writer.add_image("Example {}".format(i), color_image, 0)
 
                 #do the same thing for the second image. 
-                image = condition_images_eval[config.images_idx[i],1:2].squeeze(0).unsqueeze(-1).cpu()
-                color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
+                image = reconstructed_condition_unshaped[config.images_idx[i],1:2].squeeze(0).unsqueeze(-1).cpu()
+                color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
                 writer.add_image("Example {}".format(i), color_image, 1)
 
                 #do the same thing for 'truth'
-                image = clean_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
-                color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
+                image = reconstructed_label_unshaped[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
+                color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
                 writer.add_image("Example {}".format(i), color_image, 2)
         
         #properly setup the dataset now with shuffling 
-        train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True,num_workers=8,
-                                                       pin_memory=True,worker_init_fn = worker_init_fn)
+        train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True,num_workers=8)
         
         if config.restart:
             start_epoch, global_step = load_checkpoint(config.restart_path + 'checkpoint.pth', model, optimizer, lr_scheduler, accelerator)
@@ -352,10 +358,10 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
             #my data loader returns [TARGET, CONDITION],I seperate them here just to be clear 
             
             #TARGET
-            clean_images = batch[0]
+            clean_images = batch[0]*vae.config.scaling_factor
 
             #CONDITION
-            condition_images = batch[1]
+            condition_images = batch[1]*vae.config.scaling_factor
             
             #this is the autograd steps within the .accumulate bit (this is important for multi-GPU training)
             with accelerator.accumulate(model):
@@ -444,14 +450,31 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
                     
                     if config.plot_images:
                         #run a batch of images through for tensorboard (takes < 1 min)
-                        images_batch = edm_sampler(model,latents,condition_images_eval,num_steps=18)
+                        images_batch = edm_sampler(model,condition_images_eval*vae.config.scaling_factor,num_steps=18)
+                        
+                        images_batch = images_batch*(1/vae.config.scaling_factor)
+                        #reshape images for the decoding 
+                        images_batch_reshaped = torch.reshape(images_batch,
+                                                                       [images_batch.shape[0]*1,
+                                                                        vae.config.latent_channels,
+                                                                        images_batch.shape[2],
+                                                                        images_batch.shape[3]])
+            
+                        #check recons. just in case, trust issues 
+                        with torch.no_grad():
+                            reconstructed_images_batch = vae.decode(images_batch_reshaped.to(torch.float)) #input should be [batch*channel,4,64,64]
+                            #take the mean across RGB 
+                            reconstructed_images_batch = reconstructed_images_batch.sample.mean(axis=1) #reconstructed should be [batch*channel,3,256,256]
 
+                        #put it back to the normal shape 
+                        reconstructed_images_batch_unshaped = torch.reshape(reconstructed_images_batch,[images_batch.shape[0],1,256,256])
+            
                         for i in np.arange(0,len(config.images_idx)):
 
                             #reshape the image so we can add color to the tensorboard
-                            image = images_batch[config.images_idx[i]].squeeze(0).unsqueeze(-1).cpu().numpy()
+                            image = reconstructed_images_batch_unshaped[config.images_idx[i]].squeeze(0).unsqueeze(-1).cpu().numpy()
                             #colorize the image 
-                            color_image = torch.tensor(colorize(image,vmin=-3,vmax=3,cmap='Spectral_r')).permute(2, 0, 1)
+                            color_image = torch.tensor(colorize(image,vmin=-1,vmax=1,cmap='Spectral_r')).permute(2, 0, 1)
 
                             #add to board 
                             writer.add_image("Output Example {}".format(i), color_image, epoch)
@@ -472,62 +495,75 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
             break
         #run some cleanup, because leaks             
         gc.collect()
-        
-def edm_sampler(net, latents, condition_images, randn_like=torch.randn_like,num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
-    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
-):
+
+def edm_sampler(net, condition_images,num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,randn_like=torch.randn_like,
+    S_churn=0, S_min=0, S_max=float('inf'), S_noise=1):
     """ adapted from: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/generate.py 
     
-    only thing i had to change was provide a condition as input to this func, then take that input and concat with generated image for the model call. 
-    
-    net: expects a wrapped diffusers model with the EDMPrecond
-    latents: a noise seed with the same shape as condition_images
-    condition_images: the condition, [batch or ens_size,condition_channels,nx,ny]
-    randn_like: how to generate randomness
-    num_steps: the number of generation steps you want to take (note model calls are ~2x this because the second order correction)
-    sigma_min: smallest amount of noise 
-    sigma_max: largest amount of noise 
-    rho: related to the step size with time ??? 
-    S_churn: how much stocasisty you want to add to the process 
-    S_min: min sigma step of when to add the stocastic bit 
-    S_max: max sigma step of when to add the stocastic bit  
-    S_noise: scale to the noise we add in the stocastic bit 
-    
     """
+    #shape of input condition, needed to help get shapes right of the noise. 
+    shaper = condition_images.shape
+
+    
     # Adjust noise levels based on what's supported by the network.
     sigma_min = max(sigma_min, net.sigma_min)
     sigma_max = min(sigma_max, net.sigma_max)
 
     # Time step discretization.
-    step_indices = torch.arange(num_steps, dtype=torch.float64, device=latents.device)
+    step_indices = torch.arange(num_steps, dtype=torch.float64, device=condition_images.device)
     t_steps = (sigma_max ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
     t_steps = torch.cat([net.round_sigma(t_steps), torch.zeros_like(t_steps[:1])]) # t_N = 0
-    
-    # Main sampling loop.
-    x_next = latents.to(torch.float64) * t_steps[0]
-    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])): # 0, ..., N-1
-        x_cur = x_next
 
-        # Increase noise temporarily.
+    #initalize noise seed; HARDCODE channel dim
+    n_both  = torch.randn_like(torch.zeros([shaper[0],net.in_channels,shaper[2],shaper[3]],device=condition_images.device))
+    # Initalize the first noise image
+    x_next = torch.clone(n_both[:,0:net.out_channels].to(torch.float64)) * t_steps[0]
+    #seperate out the noise seeds for the condition 
+    n_condition = torch.clone(n_both[:,net.out_channels:])
+    
+    total_steps = len(t_steps) - 1
+    for i, (t_cur, t_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
+        x_cur = torch.clone(x_next)
+
+        # Increase noise temporarily. this is the stocastic SDE part, that allows it to change tracks 
         gamma = min(S_churn / num_steps, np.sqrt(2) - 1) if S_min <= t_cur <= S_max else 0
         t_hat = net.round_sigma(t_cur + gamma * t_cur)
         x_hat = x_cur + (t_hat ** 2 - t_cur ** 2).sqrt() * S_noise * randn_like(x_cur)
 
-        #need to concat the condition here 
-        model_input_images = torch.cat([x_hat, condition_images], dim=1)
-        # Euler step.
+        #do like we do in the training, do the forward pass on the condition based on the current sigma
+        n_current =  torch.clone(n_condition*t_hat)
+        
+        #add noise to condition 
+        noisy_condition_current = torch.clone(condition_images+n_current)
+
+        #concat the image you want to generate on the front of the noisy_condition 
+        model_input_images = torch.cat([x_hat, noisy_condition_current], dim=1)
+        
+        #denoise image at the current noise level (t_hat)
         with torch.no_grad():
             denoised = net(model_input_images, t_hat).to(torch.float64)
 
+        #get the slope (or change in x) to sigma = 0 
         d_cur = (x_hat - denoised) / t_hat
+        
+        #adjust x, but scaled by the dsigma [deltax/deltasigma = d_cur]
         x_next = x_hat + (t_next - t_hat) * d_cur
+        
+        #Apply 2nd order correction.
+        if i < (num_steps - 1):
+            #x_next is now at the next sigma, so adjust the condition accordingly 
+            n_next =  torch.clone(n_condition*t_next)
+            noisy_condition_next = torch.clone(condition_images+n_next)
+            #concat the image you want to generate on the front again 
+            model_input_images = torch.cat([x_next, noisy_condition_next], dim=1)
 
-        # Apply 2nd order correction.
-        if i < num_steps - 1:
-            model_input_images = torch.cat([x_next, condition_images], dim=1)
+            #denoise 
             with torch.no_grad():
                 denoised = net(model_input_images, t_next).to(torch.float64)
+
+            #get the slope (or change in x_next) to sigma = 0 
             d_prime = (x_next - denoised) / t_next
+            #go back to the current x, and do the 2nd order correction 
             x_next = x_hat + (t_next - t_hat) * (0.5 * d_cur + 0.5 * d_prime)
 
     return x_next
@@ -623,7 +659,7 @@ def save_checkpoint(model, optimizer, lr_scheduler, epoch, step, accelerator, ch
     if accelerator.is_main_process:
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved at epoch {epoch}, step {step}.")
-    
+
 def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, accelerator):
     """ A function from chatGPT to help load checkpoints training restarts """ 
     checkpoint = torch.load(checkpoint_path, map_location=accelerator.device)
@@ -635,7 +671,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, accelerator
     print(f"Checkpoint loaded. Resuming from epoch {epoch}, step {step}.")
     return epoch, step
 
-#################### \Funcs ########################
+# ################### \Funcs ########################
 
 
 #initalize config 
@@ -648,8 +684,8 @@ dataset = ZarrDataset(config.dataset_path)
 # in_channels = noisy_dim + condition_channels. 
 model = UNet2DModel(
     sample_size=config.image_size,  # the target image resolution
-    in_channels=3,  # the number of input channels, 3 for RGB images
-    out_channels=1,  # the number of output channels
+    in_channels=48,  # the number of input channels, 3 for RGB images
+    out_channels=16,  # the number of output channels
     layers_per_block=2,  # how many ResNet layers to use per UNet block
     block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
     down_block_types=(
@@ -671,8 +707,8 @@ model = UNet2DModel(
 )
 
 #wrap diffusers/pytorch model 
-model_wrapped = EDMPrecond(1,model)
-    
+model_wrapped = EDMPrecond(16,model)
+
 #left this the same as the butterfly example 
 optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), lr=config.learning_rate)
 lr_scheduler = get_cosine_schedule_with_warmup(

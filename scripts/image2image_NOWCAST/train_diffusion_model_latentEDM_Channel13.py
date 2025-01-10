@@ -24,6 +24,7 @@ import math
 from typing import List, Optional, Tuple, Union
 from diffusers.utils.torch_utils import randn_tensor
 from torch.utils.tensorboard import SummaryWriter
+from diffusers import AutoencoderKL
 
 
 #################### \Imports ########################
@@ -35,7 +36,7 @@ from torch.utils.tensorboard import SummaryWriter
 class TrainingConfig:
     """ This should be probably in some sort of config file, but for now its here... """
     #data things 
-    image_size = 256  #this assumes square images
+    image_size = 64  #this assumes square images
     train_batch_size = 45 #this is as big as I can fit on the GH200 [45,3,256,256]
     
     #training things 
@@ -45,14 +46,15 @@ class TrainingConfig:
     lr_warmup_steps = 500 #default value from butterflies example
     save_model_epochs = 1 #i like to save alot, doesnt cost much 
     mixed_precision = "fp16"
-    output_dir = "/mnt/data1/rchas1/diffusion_edm_fixed_scaling/"  # the local path to store the model 
+    output_dir = "/mnt/data1/rchas1/latentedm_10_two_inputs_radames_fixeddata_TEST/"  # the local path to store the model 
     push_to_hub = False 
     hub_private_repo = False
     overwrite_output_dir = True  
     seed = 0 
     restart = False #do you want to start from a previous training?
-    restart_path = "/mnt/data1/rchas1/diffusion_edm_fixed_scaling/"
-    dataset_path = "/home/rchas1/diffusion_10_4_2inputs_v3_gh200.zarr"
+    restart_path = "/mnt/data1/rchas1/latentedm_10_two_inputs_radames_fixeddata/"
+    
+    dataset_path = "/mnt/data1/rchas1/diffusion_10_4_2inputs_v3_gh200_latent_radames.zarr"
     
     #tensorboard things 
     plot_images = True 
@@ -68,6 +70,8 @@ class TrainingConfig:
     min_delta = 1e-6  # Minimum change in loss to be considered as improvement
     window_size = 5  # Define the window size for the moving average
     
+    #vae path on huggingface
+    vae_path = "radames/stable-diffusion-x4-upscaler-img2img"
     
     
     
@@ -196,22 +200,6 @@ class EDMLoss:
         
         return loss
     
-# class ZarrDataset(Dataset):
-#     """This is a new zarr instance of the dataset chunked at the desired batchsize to ensure the GPU is fed. """
-#     def __init__(self, zarr_store):
-#         self.store = zarr_store
-#         self.data = zarr.open(self.store, mode='r')
-#         self.length = self.data['input_images'].shape[0]
-
-#     def __len__(self):
-#         return self.length
-
-#     def __getitem__(self, idx):
-#         # Load data lazily
-#         input_image = self.data['input_images'][idx]
-#         output_image = self.data['output_images'][idx]
-#         return torch.tensor(output_image, dtype=torch.float16),torch.tensor(input_image, dtype=torch.float16)
-
 class ZarrDataset(Dataset):
     """
     This is a new zarr instance of the dataset that loads all data into CPU memory to minimize I/O overhead.
@@ -270,11 +258,17 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
         
         if config.plot_images:
             
+            #need to decode the images
+            #load vae 
+            vae =  AutoencoderKL.from_pretrained(config.vae_path, subfolder="vae").to('cuda')
+#             vae =  AutoencoderKL.from_pretrained(config.vae_path).to('cuda')
+            
+            
             #image writer for the tensorboard 
             writer = SummaryWriter(config.output_dir + "logs/images")
             #need a random seed for the edm process that we run after every epoch.         
             rnd = StackedRandomGenerator('cuda',np.arange(0,config.train_batch_size,1).astype(int).tolist())
-            latents = rnd.randn([config.train_batch_size, 1, 256, 256],device='cuda')
+            latents = rnd.randn([config.train_batch_size, vae.config.latent_channels, 64, 64],device='cuda')
 
             #setup the dataset now WITHOUT shuffling, for consistent eval images 
             train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=False)
@@ -289,10 +283,51 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
                         break 
 
             del train_dataloader 
+
+            #reshape images for the decoding 
+            condition_images_eval_reshaped = torch.reshape(condition_images_eval,
+                                                           [condition_images_eval.shape[0]*2,
+                                                            vae.config.latent_channels,
+                                                            condition_images_eval.shape[2],
+                                                            condition_images_eval.shape[3]])
+            
+            clean_images_eval_reshaped =  torch.reshape(clean_images_eval,
+                                                           [clean_images_eval.shape[0]*1,
+                                                            vae.config.latent_channels,
+                                                            clean_images_eval.shape[2],
+                                                            clean_images_eval.shape[3]])
+            
+            #undo mean,std scaling that was done for diffusion 
+            condition_std = torch.tensor(6.0271)
+            condition_mean = torch.tensor(-4.2534)
+            condition_images_eval_reshaped = (condition_images_eval_reshaped*condition_std) + condition_mean 
+            clean_images_eval_reshaped = (clean_images_eval_reshaped*condition_std) + condition_mean 
+            
+            #check recons. just in case, trust issues 
+            with torch.no_grad():
+                reconstructed_condition = vae.decode(condition_images_eval_reshaped.to(torch.float)) #input should be [batch*channel,4,64,64]
+                #take the mean across RGB 
+                reconstructed_condition = reconstructed_condition.sample.mean(axis=1) #reconstructed should be [batch*channel,3,256,256]
+                
+                reconstructed_label = vae.decode(clean_images_eval_reshaped.to(torch.float)) #input should be [batch*channel,4,64,64]
+                #take the mean across RGB 
+                reconstructed_label = reconstructed_label.sample.mean(axis=1) #reconstructed should be [batch*channel,3,256,256]
+                
+            #put it back to the normal shape 
+            reconstructed_condition_unshaped = torch.reshape(reconstructed_condition,[condition_images_eval.shape[0],2,256,256])
+            reconstructed_label_unshaped = torch.reshape(reconstructed_label,[condition_images_eval.shape[0],1,256,256])
+            
+            #undo 0-1 scaling that was done for the VAE 
+            data_min = -6.16015625
+            data_max = 3.15234375
+            
+            #need to scale to 0 - 1 for vae 
+            reconstructed_condition_unshaped = reconstructed_condition_unshaped*(data_max-data_min) + data_min
+            reconstructed_label_unshaped = reconstructed_label_unshaped*(data_max-data_min) + data_min
             
             for i in np.arange(0,len(config.images_idx)):
                 #reshape image for adding a color image to the tensorboard 
-                image = condition_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
+                image = reconstructed_condition_unshaped[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
                 #add color and convert shapes back. 
                 color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
 
@@ -300,18 +335,17 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
                 writer.add_image("Example {}".format(i), color_image, 0)
 
                 #do the same thing for the second image. 
-                image = condition_images_eval[config.images_idx[i],1:2].squeeze(0).unsqueeze(-1).cpu()
+                image = reconstructed_condition_unshaped[config.images_idx[i],1:2].squeeze(0).unsqueeze(-1).cpu()
                 color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
                 writer.add_image("Example {}".format(i), color_image, 1)
 
                 #do the same thing for 'truth'
-                image = clean_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
+                image = reconstructed_label_unshaped[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
                 color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
                 writer.add_image("Example {}".format(i), color_image, 2)
         
         #properly setup the dataset now with shuffling 
-        train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True,num_workers=8,
-                                                       pin_memory=True,worker_init_fn = worker_init_fn)
+        train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=config.train_batch_size, shuffle=True,num_workers=8)
         
         if config.restart:
             start_epoch, global_step = load_checkpoint(config.restart_path + 'checkpoint.pth', model, optimizer, lr_scheduler, accelerator)
@@ -445,13 +479,36 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
                     if config.plot_images:
                         #run a batch of images through for tensorboard (takes < 1 min)
                         images_batch = edm_sampler(model,latents,condition_images_eval,num_steps=18)
+                        
+                        #undo mean0,std1 scalaing before decoding 
+                        images_batch = (images_batch*condition_std) + condition_mean 
+                        
+                        #reshape images for the decoding 
+                        images_batch_reshaped = torch.reshape(images_batch,
+                                                                       [images_batch.shape[0]*1,
+                                                                        vae.config.latent_channels,
+                                                                        images_batch.shape[2],
+                                                                        images_batch.shape[3]])
+            
+                        #check recons. just in case, trust issues 
+                        with torch.no_grad():
+                            #decode the image 
+                            reconstructed_images_batch = vae.decode(images_batch_reshaped.to(torch.float)) #input should be [batch*channel,4,64,64]
+                            #take the mean across RGB 
+                            reconstructed_images_batch = reconstructed_images_batch.sample.mean(axis=1) #reconstructed should be [batch*channel,3,256,256]
 
+                        #put it back to the normal shape 
+                        reconstructed_images_batch_unshaped = torch.reshape(reconstructed_images_batch,[images_batch.shape[0],1,256,256])
+                        
+                        #undo the 0-1 scaling that the vae wanted 
+                        reconstructed_images_batch_unshaped = reconstructed_images_batch_unshaped*(data_max-data_min) + data_min
+                        
                         for i in np.arange(0,len(config.images_idx)):
 
                             #reshape the image so we can add color to the tensorboard
-                            image = images_batch[config.images_idx[i]].squeeze(0).unsqueeze(-1).cpu().numpy()
+                            image = reconstructed_images_batch_unshaped[config.images_idx[i]].squeeze(0).unsqueeze(-1).cpu().numpy()
                             #colorize the image 
-                            color_image = torch.tensor(colorize(image,vmin=-3,vmax=3,cmap='Spectral_r')).permute(2, 0, 1)
+                            color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
 
                             #add to board 
                             writer.add_image("Output Example {}".format(i), color_image, epoch)
@@ -648,8 +705,8 @@ dataset = ZarrDataset(config.dataset_path)
 # in_channels = noisy_dim + condition_channels. 
 model = UNet2DModel(
     sample_size=config.image_size,  # the target image resolution
-    in_channels=3,  # the number of input channels, 3 for RGB images
-    out_channels=1,  # the number of output channels
+    in_channels=12,  # the number of input channels, 3 for RGB images
+    out_channels=4,  # the number of output channels
     layers_per_block=2,  # how many ResNet layers to use per UNet block
     block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
     down_block_types=(
@@ -671,7 +728,7 @@ model = UNet2DModel(
 )
 
 #wrap diffusers/pytorch model 
-model_wrapped = EDMPrecond(1,model)
+model_wrapped = EDMPrecond(4,model)
     
 #left this the same as the butterfly example 
 optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), lr=config.learning_rate)

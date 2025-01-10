@@ -1,4 +1,4 @@
-#################### Imports ########################
+# ################### Imports ########################
 
 import torch
 import zarr
@@ -26,10 +26,10 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch.utils.tensorboard import SummaryWriter
 
 
-#################### \Imports ########################
+# ################### \Imports ########################
 
 
-#################### Classes ########################
+# ################### Classes ########################
 
 @dataclass
 class TrainingConfig:
@@ -45,14 +45,14 @@ class TrainingConfig:
     lr_warmup_steps = 500 #default value from butterflies example
     save_model_epochs = 1 #i like to save alot, doesnt cost much 
     mixed_precision = "fp16"
-    output_dir = "/mnt/data1/rchas1/diffusion_edm_fixed_scaling/"  # the local path to store the model 
+    output_dir = "/mnt/data1/rchas1/edm_10_CorrDiff_TEST/"  # the local path to store the model 
     push_to_hub = False 
     hub_private_repo = False
     overwrite_output_dir = True  
     seed = 0 
     restart = False #do you want to start from a previous training?
-    restart_path = "/mnt/data1/rchas1/diffusion_edm_fixed_scaling/"
-    dataset_path = "/home/rchas1/diffusion_10_4_2inputs_v3_gh200.zarr"
+    restart_path = None
+    dataset_path = "/mnt/data1/rchas1/diffusion_10_4_2inputs_v3_gh200_CorrDiff.zarr"
     
     #tensorboard things 
     plot_images = True 
@@ -67,10 +67,10 @@ class TrainingConfig:
     patience = 100  # Number of epochs to wait for improvement
     min_delta = 1e-6  # Minimum change in loss to be considered as improvement
     window_size = 5  # Define the window size for the moving average
+
     
-    
-    
-    
+
+
 class EDMPrecond(torch.nn.Module):
     """ Original Func:: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/training/networks.py#L519
     
@@ -195,7 +195,7 @@ class EDMLoss:
         loss = weight * ((denoised_images - clean_images) ** 2)
         
         return loss
-    
+
 # class ZarrDataset(Dataset):
 #     """This is a new zarr instance of the dataset chunked at the desired batchsize to ensure the GPU is fed. """
 #     def __init__(self, zarr_store):
@@ -232,9 +232,9 @@ class ZarrDataset(Dataset):
         # Access data from memory (still on the CPU)
         return self.output_images[idx], self.input_images[idx]
 
-#################### \Classes ########################
+# ################### \Classes ########################
 
-#################### Funcs ########################
+# ################### Funcs ########################
 
 def worker_init_fn(worker_id):
     os.sched_setaffinity(0, range(os.cpu_count())) 
@@ -290,6 +290,12 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
 
             del train_dataloader 
             
+            #undo the scaling before adding to the original image 
+            data_mean = torch.tensor(-0.0009)
+            data_std = torch.tensor(0.0807)
+
+            clean_images_eval = clean_images_eval*data_std + data_mean
+            
             for i in np.arange(0,len(config.images_idx)):
                 #reshape image for adding a color image to the tensorboard 
                 image = condition_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
@@ -305,7 +311,7 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
                 writer.add_image("Example {}".format(i), color_image, 1)
 
                 #do the same thing for 'truth'
-                image = clean_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu()
+                image = clean_images_eval[config.images_idx[i],0:1].squeeze(0).unsqueeze(-1).cpu() + condition_images_eval[config.images_idx[i],2:3].squeeze(0).unsqueeze(-1).cpu()
                 color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
                 writer.add_image("Example {}".format(i), color_image, 2)
         
@@ -393,6 +399,7 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
             global_step += 1
             
             
+            
         #now that we saw the dataset once, lets do some book keeping. 
         
         # Synchronize epoch loss across devices, this will just concat the two 
@@ -445,13 +452,19 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
                     if config.plot_images:
                         #run a batch of images through for tensorboard (takes < 1 min)
                         images_batch = edm_sampler(model,latents,condition_images_eval,num_steps=18)
+                        
+                        #undo the scaling before adding to the original image 
+                        data_mean = torch.tensor(-0.0009)
+                        data_std = torch.tensor(0.0807)
+                        
+                        images_batch = images_batch*data_std + data_mean
 
                         for i in np.arange(0,len(config.images_idx)):
 
                             #reshape the image so we can add color to the tensorboard
-                            image = images_batch[config.images_idx[i]].squeeze(0).unsqueeze(-1).cpu().numpy()
+                            image = images_batch[config.images_idx[i]].squeeze(0).unsqueeze(-1).cpu().numpy()+ condition_images_eval[config.images_idx[i],2:3].squeeze(0).unsqueeze(-1).cpu().numpy()
                             #colorize the image 
-                            color_image = torch.tensor(colorize(image,vmin=-3,vmax=3,cmap='Spectral_r')).permute(2, 0, 1)
+                            color_image = torch.tensor(colorize(image,vmin=-6,vmax=4,cmap='Spectral_r')).permute(2, 0, 1)
 
                             #add to board 
                             writer.add_image("Output Example {}".format(i), color_image, epoch)
@@ -472,7 +485,7 @@ def train_loop(config, model, optimizer, dataset, lr_scheduler):
             break
         #run some cleanup, because leaks             
         gc.collect()
-        
+
 def edm_sampler(net, latents, condition_images, randn_like=torch.randn_like,num_steps=18, sigma_min=0.002, sigma_max=80, rho=7,
     S_churn=0, S_min=0, S_max=float('inf'), S_noise=1,
 ):
@@ -623,7 +636,7 @@ def save_checkpoint(model, optimizer, lr_scheduler, epoch, step, accelerator, ch
     if accelerator.is_main_process:
         torch.save(checkpoint, checkpoint_path)
         print(f"Checkpoint saved at epoch {epoch}, step {step}.")
-    
+
 def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, accelerator):
     """ A function from chatGPT to help load checkpoints training restarts """ 
     checkpoint = torch.load(checkpoint_path, map_location=accelerator.device)
@@ -635,7 +648,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, lr_scheduler, accelerator
     print(f"Checkpoint loaded. Resuming from epoch {epoch}, step {step}.")
     return epoch, step
 
-#################### \Funcs ########################
+# ################### \Funcs ########################
 
 
 #initalize config 
@@ -648,7 +661,7 @@ dataset = ZarrDataset(config.dataset_path)
 # in_channels = noisy_dim + condition_channels. 
 model = UNet2DModel(
     sample_size=config.image_size,  # the target image resolution
-    in_channels=3,  # the number of input channels, 3 for RGB images
+    in_channels=4,  # the number of input channels, 3 for RGB images
     out_channels=1,  # the number of output channels
     layers_per_block=2,  # how many ResNet layers to use per UNet block
     block_out_channels=(128, 128, 256, 256, 512, 512),  # the number of output channels for each UNet block
@@ -672,7 +685,7 @@ model = UNet2DModel(
 
 #wrap diffusers/pytorch model 
 model_wrapped = EDMPrecond(1,model)
-    
+
 #left this the same as the butterfly example 
 optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), lr=config.learning_rate)
 lr_scheduler = get_cosine_schedule_with_warmup(
