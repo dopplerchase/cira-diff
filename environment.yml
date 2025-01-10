@@ -1,0 +1,13 @@
+name: cira_diffusion
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - matplotlib
+  - xarray
+  - netcdf4
+  - dask
+
+
