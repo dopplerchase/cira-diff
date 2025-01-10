@@ -1,17 +1,20 @@
 import torch 
 
-
 class EDMPrecond(torch.nn.Module):
     """ Original Func:: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/training/networks.py#L519
     
-    This is a wrapper for your diffusers model. It's purpose is to apply the preconditioning that is talked about in Karras et al. (2022)'s EDM paper. 
+    This is a wrapper for your pytorch model. It's purpose is to apply the preconditioning that is talked about in Karras et al. (2022)'s EDM paper. 
     
     I've made some changes for the sake of conditional-EDM (the original paper is unconditional).
-    
+
+    Example use: 
+
+    model_wrapper = EDMPrecond(generation_channels=3, model=model, use_fp16=True, sigma_min=0.002, sigma_max=80, sigma_data=0.5)
+
     """
     def __init__(self,
-        generation_channels,                # number of channels you want to generate
-        model,                              # pytorch model from diffusers 
+        generation_channels,                # number of channels you want to GENERATE, this is the number of channels that will be denoised
+        model,                              # pytorch model
         use_fp16        = True,             # Execute the underlying model at FP16 precision?
         sigma_min       = 0,                # Minimum supported noise level.
         sigma_max       = float('inf'),     # Maximum supported noise level.
@@ -31,9 +34,9 @@ class EDMPrecond(torch.nn.Module):
         
         This method is to 'call' the neural net. But this is the preconditioning from the Karras EDM paper. 
         
-        note for conditional, it expects x to have the condition in the channel dim (dim=1). and the images you want to generate should already have noise.
+        note for conditional, it expects x to have the condition in the channel dim (axis=1). and the images you want to generate should already have noise.
         
-        x: input stacked image with the generation images stacked with the condition images [batch,generation_channels + condition_channels,nx,ny]
+        x: input stacked image with the generation images stacked (axis=0) with the condition images [batch,generation_channels + condition_channels,nx,ny]
         sigma: the noise level of the images in batch [??]
         force_fp32: this is forcing calculations to be a certain percision. 
         
@@ -47,7 +50,7 @@ class EDMPrecond(torch.nn.Module):
         #forcing dtype matching
         dtype = torch.float16 if (self.use_fp16 and not force_fp32 and x.device.type == 'cuda') else torch.float32
         
-        #get weights from EDM 
+        #get weights from Karras et al. 2022 EDM 
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
         c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
@@ -59,11 +62,10 @@ class EDMPrecond(torch.nn.Module):
         #the condition
         x_condition = torch.clone(x[:,self.generation_channels:])
 
-        
-        #concatinate back with the scaling applied to only the the generation dimension (x_noisy)
+        #concatinate back with the scaling applied to ONLY the the generation dimension (x_noisy)
         model_input_images = torch.cat([x_noisy*c_in, x_condition], dim=1)
         
-        #denoise the image (e.g., run it through your diffusers model) 
+        #denoise the image (e.g., run it through your pytorch model), the model here expects 2 inputs, the images and the noise. This is following Diffusers
         F_x = self.model((model_input_images).to(dtype), c_noise.flatten(), return_dict=False)[0]
         
         #force dtype
@@ -85,7 +87,7 @@ class EDMLoss:
     
     """
     def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
-        """ These describe the distribution of sigmas we should sample during training """
+        """ These describe the distribution of sigmas we should sample during training. The default values are from Karras et al. 2022 and worked for us."""
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -94,16 +96,16 @@ class EDMLoss:
         
         """ 
         
-        net: is a pytorch model wrapped with EDMPrecond
-        clean_images: the images you want to generate, [batch,generation_channels,nx,ny]
-        condition_images:images you want to condition with [batch,condition_channels,nx,ny]
+        net: is a pytorch model wrapped with EDMPrecond (see above)
+        clean_images: tensor of images you want to generate, [batch,generation_channels,nx,ny] 
+        condition_images: tensor of images you want to condition with [batch,condition_channels,nx,ny]
         
         """
         
-        #get random seeds, one for each image in the batch 
+        #get random seeds, one for each image in the batch, make sure its on the device. 
         rnd_normal = torch.randn([clean_images.shape[0], 1, 1, 1], device=clean_images.device)
         
-        #get random noise levels (sigmas)
+        #get random noise levels (sigmas) based on the prescribed distribution.
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
         
         #get the loss weight for those sigmas 
@@ -121,7 +123,7 @@ class EDMLoss:
         #call the EDMPrecond model 
         denoised_images = net(model_input_images, sigma)
         
-        #calc the weighted loss at each pixel, the mean across all GPUs and pixels is in the main train_loop 
+        #calc the weighted loss (MSE) at each pixel, the mean across all GPUs and pixels is in the main train_loop
         loss = weight * ((denoised_images - clean_images) ** 2)
         
         return loss
@@ -131,7 +133,7 @@ def edm_sampler(net, latents, condition_images, randn_like=torch.randn_like,num_
 ):
     """ adapted from: https://github.com/NVlabs/edm/blob/008a4e5316c8e3bfe61a62f874bddba254295afb/generate.py 
     
-    only thing i had to change was provide a condition as input to this func, then take that input and concat with generated image for the model call. 
+    only thing I had to change was provide a condition as input to this func, then take that input and concat with generated image for the model call. 
     
     net: expects a wrapped diffusers model with the EDMPrecond
     latents: a noise seed with the same shape as condition_images
