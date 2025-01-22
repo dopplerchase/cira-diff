@@ -1,3 +1,10 @@
+""" 
+Python file associated with various dataset classes.
+
+For our inital research, we used a single zarr file with a dataset premade. The easiest implementation for you to do the same is to mimic the dataset class below
+
+""" 
+
 from torch.utils.data import Dataset
 import zarr
 import torch 

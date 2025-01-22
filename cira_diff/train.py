@@ -1,3 +1,7 @@
+""" 
+Python file to train an EDM based diffusion model 
+""" 
+
 import torch
 import zarr
 from diffusers import UNet2DModel
@@ -21,6 +25,8 @@ from diffusers.utils.torch_utils import randn_tensor
 from torch.utils.tensorboard import SummaryWriter
 import importlib.util
 import sys
+import py3nvml
+from cira_diff.util import *
 
 def train_loop(config, model, optimizer, dataset, lr_scheduler):
     """ 
@@ -289,50 +295,53 @@ def main():
         for key, value in vars(config).items():
             print(f"{key}: {value}")
 
-    if args.verbose:
-        print('Loading dataset')
+    #isolate GPU(s)
+    py3nvml.grab_gpus(num_gpus=len(config.gpu_id_selection), gpu_select=config.gpu_id_selection)
+
+    # if args.verbose:
+    #     print('Loading dataset')
     
-    # Initialize the dataset
-    dataset = ZarrDataset(config.dataset_path)
+    # # Initialize the dataset
+    # dataset = ZarrDataset(config.dataset_path)
 
-    if args.verbose:
-        print('Loaded')
+    # if args.verbose:
+    #     print('Loaded')
 
-    if args.verbose:
-        print('Building model based on config and wrapping')
+    # if args.verbose:
+    #     print('Building model based on config and wrapping')
 
-    #Initialize the model
-    model = build_model(config)
+    # #Initialize the model
+    # model = build_model(config)
 
-    #wrap diffusers/pytorch model with the scalings from Karras et al. (2022)
-    model_wrapped = EDMPrecond(1,model)
+    # #wrap diffusers/pytorch model with the scalings from Karras et al. (2022)
+    # model_wrapped = EDMPrecond(1,model)
 
-    if args.verbose:
-        print('Built')
+    # if args.verbose:
+    #     print('Built')
 
 
-    if args.verbose:
-        print('Initializing optimizer and scheduler')
+    # if args.verbose:
+    #     print('Initializing optimizer and scheduler')
 
-    #initalize the optimizer
-    optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), lr=config.learning_rate)
-    lr_scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        num_warmup_steps=config.lr_warmup_steps,
-        num_training_steps=(dataset.length * config.num_epochs),
-    )
+    # #initalize the optimizer
+    # optimizer = torch.optim.AdamW(model_wrapped.model.parameters(), lr=config.learning_rate)
+    # lr_scheduler = get_cosine_schedule_with_warmup(
+    #     optimizer=optimizer,
+    #     num_warmup_steps=config.lr_warmup_steps,
+    #     num_training_steps=(dataset.length * config.num_epochs),
+    # )
 
-    if args.verbose:
-        print('Done')
+    # if args.verbose:
+    #     print('Done')
 
-    if args.verbose:
-        print('Starting Training')
+    # if args.verbose:
+    #     print('Starting Training')
 
-    #main method here! 
-    train_loop(config, model_wrapped, optimizer, dataset, lr_scheduler)
+    # #main method here! 
+    # train_loop(config, model_wrapped, optimizer, dataset, lr_scheduler)
 
-    if args.verbose:
-        print('DoneDoneDone!')
+    # if args.verbose:
+    #     print('DoneDoneDone!')
 
 if __name__ == "__main__":
     main()

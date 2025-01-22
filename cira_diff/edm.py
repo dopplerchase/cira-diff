@@ -1,3 +1,10 @@
+""" 
+Python file that houses all the NVIDIA EDM code with some small adaptations to run on conditional images
+
+Most of it is from here: https://github.com/NVlabs/edm/
+
+""" 
+
 import torch 
 
 class EDMPrecond(torch.nn.Module):

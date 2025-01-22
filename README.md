@@ -29,15 +29,19 @@ Our implementation of the code comes directly out of the [original repo](https:/
 
    ``mamba create -n cira-diff``
 
+   activate it 
+
+   ``mamba activate cira-diff``
+
    Then install pytorch first: 
    
-   ``mamba install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia``
+   ``mamba install pytorch torchvision torchaudio pytorch-cuda=12.4 -c pytorch -c nvidia``
 
    Note this is how I installed pytorch for the CUDA my GPUs have. If you dont have CUDA 12, change this to one of the 11.8s or something. You can see which CUDA is compiled by running `nvidia-smi` on a node where GPUs are connected. Alternatively, if you are using GH200s, you will need to use docker and the precompiled pytorch they give you. Example [here](https://dopplerchase-ai2es-schooner-hpc.readthedocs.io/en/latest/cira.html#gh200-how-to).
 
    Next up, install diffusers, transformers and accelerate. If you don't want to use diffuser models, you could skip this, but know the code will break because we import it later. We also install some other common packages here too: 
 
-   ``pip install diffusers["torch"] transformers accelerate matplotlib tensorboard`` 
+   ``pip install diffusers["torch"] transformers accelerate matplotlib tensorboard py3nvml build zarr`` 
 
 5. Install local repo 
 

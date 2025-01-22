@@ -3,6 +3,7 @@ import matplotlib.cm
 import os 
 import torch 
 from diffusers import UNet2DModel
+import importlib
 
 def colorize(value, vmin=None, vmax=None, cmap=None):
     """
@@ -80,7 +81,7 @@ def load_config(config_path):
     # Instantiate the dataclass and return it
     return config_module.TrainingConfig()
 
-def build_model(config: TrainingConfig):
+def build_model(config):
     model_class = MODEL_CLASSES.get(config.model_type)
     if model_class is None:
         raise ValueError(f"Unsupported model type: {config.model_type}")

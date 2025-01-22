@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 
 @dataclass
 class TrainingConfig:
@@ -26,7 +27,7 @@ class TrainingConfig:
     
     #tensorboard things 
     plot_images: bool = True 
-    images_idx: Tuple[int, ...] = [3,5,10,15] #these need to be smaller than train_batch_size 
+    images_idx: List[int] = field(default_factory=lambda: [3, 5, 10, 15]) #these need to be smaller than train_batch_size 
     use_tensorboard: bool = True
     
     # Loss parameters
@@ -65,6 +66,9 @@ class TrainingConfig:
         "UpBlock2D",
         "UpBlock2D",
     )
+
+    #hardware things NEED TO CHANGE THIS TO WORK WITH MORE THAN 1 GPU
+    gpu_id_selection: List[int] = field(default_factory=lambda: [1])
 
 
     
