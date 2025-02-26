@@ -16,7 +16,7 @@ class TrainingConfig:
     llr_warmup_steps: int = 500 #default value from butterflies example
     save_model_epochs: int = 1 #i like to save alot, doesnt cost much time. But this will overwrite, not write a new chkp for every file.
     mixed_precision: str = "fp16"
-    output_dir: str = "/mnt/data1/rchas1/edm_10_CorrDiff_TEST/"  # the local path to store the model 
+    output_dir: str = "/mnt/data1/rchas1/CODE_REFACTOR_EDM/"  # the local path to store the model 
     push_to_hub: bool = False 
     hub_private_repo: bool = False
     overwrite_output_dir: bool = True  
