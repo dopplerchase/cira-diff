@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import List, Tuple, Optional
 
 @dataclass
 class TrainingConfig:
@@ -15,7 +16,7 @@ class TrainingConfig:
     llr_warmup_steps: int = 500 #default value from butterflies example
     save_model_epochs: int = 1 #i like to save alot, doesnt cost much time. But this will overwrite, not write a new chkp for every file.
     mixed_precision: str = "fp16"
-    output_dir: str = "/mnt/data1/rchas1/edm_10_CorrDiff_TEST/"  # the local path to store the model 
+    output_dir: str = "/mnt/data1/rchas1/CODE_REFACTOR_EDM/"  # the local path to store the model 
     push_to_hub: bool = False 
     hub_private_repo: bool = False
     overwrite_output_dir: bool = True  
@@ -26,7 +27,7 @@ class TrainingConfig:
     
     #tensorboard things 
     plot_images: bool = True 
-    images_idx: Tuple[int, ...] = [3,5,10,15] #these need to be smaller than train_batch_size 
+    images_idx: List[int] = field(default_factory=lambda: [3, 5, 10, 15]) #these need to be smaller than train_batch_size 
     use_tensorboard: bool = True
     
     # Loss parameters
@@ -65,6 +66,9 @@ class TrainingConfig:
         "UpBlock2D",
         "UpBlock2D",
     )
+
+    #hardware things NEED TO CHANGE THIS TO WORK WITH MORE THAN 1 GPU
+    gpu_id_selection: List[int] = field(default_factory=lambda: [1])
 
 
     
